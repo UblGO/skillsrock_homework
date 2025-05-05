@@ -33,6 +33,8 @@ type OrderRepository interface {
 	GetUnpublishedEvents(ctx context.Context) ([]OrderEvent, error)
 	//делает UPDATE ивента, меняя статус на published
 	SetEventAsPublished(ctx context.Context, event *OrderEvent) error
+	// Очистка outbox
+	CleanupOutdatedEvents(ctx context.Context, retention time.Duration) error
 }
 
 type MessageBroker interface {
@@ -40,7 +42,9 @@ type MessageBroker interface {
 }
 
 type Config struct {
-	PollRate time.Duration
+	PollRate        time.Duration
+	CleanupInterval time.Duration
+	RetentionPeriod time.Duration
 }
 
 type usecase struct {
@@ -100,18 +104,22 @@ func (uc *usecase) CreateOrder(ctx context.Context, userID int, amount float64) 
 
 // функция переодически запускающая опрос outbox на наличие non-published ивентов; Запускается в отдельной горутине
 func (uc *usecase) RunOutboxPoller(ctx context.Context) error {
-	ticker := time.NewTicker(uc.config.PollRate)
+	pollTicker := time.NewTicker(uc.config.PollRate)
+	cleanUpTicker := time.NewTicker(uc.config.CleanupInterval)
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
-		case <-ticker.C:
+		case <-pollTicker.C:
 			if err := uc.pollOutbox(ctx); err != nil {
+				return err
+			}
+		case <-cleanUpTicker.C:
+			if err := uc.cleanupOutdatedEvents(ctx); err != nil {
 				return err
 			}
 		}
 	}
-
 }
 
 // функция собирает non-published ивенты, отправляет в брокер, меняет статус на published
@@ -128,6 +136,13 @@ func (uc *usecase) pollOutbox(ctx context.Context) error {
 		if err := uc.repo.SetEventAsPublished(ctx, &event); err != nil {
 			return fmt.Errorf("failed to update event status: %v", err)
 		}
+	}
+	return nil
+}
+
+func (uc *usecase) cleanupOutdatedEvents(ctx context.Context) error {
+	if err := uc.repo.CleanupOutdatedEvents(ctx, uc.config.RetentionPeriod); err != nil {
+		return fmt.Errorf("failed to clean up events: %w", err)
 	}
 	return nil
 }
