@@ -7,10 +7,6 @@ import (
 	"time"
 )
 
-type Store struct {
-	repo   OrderRepository
-	broker MessageBroker
-}
 type Order struct {
 	ID     int
 	UserID int
@@ -24,6 +20,11 @@ type OrderEvent struct {
 	Amount  float64
 	Status  string
 }
+type TxManager interface {
+	Begin(ctx context.Context) error
+	Rollback()
+	Commit(ctx context.Context) error
+}
 type OrderRepository interface {
 	CreateOrder(ctx context.Context, order *Order) error
 	CreateOutboxEvent(ctx context.Context, event *OrderEvent) error
@@ -36,16 +37,22 @@ type OrderRepository interface {
 
 type MessageBroker interface {
 	PublishOrderCreated(ctx context.Context, event *OrderEvent) error
-	PollOutbox(ctx context.Context, broker MessageBroker, repo OrderRepository) error
+}
+
+type Config struct {
+	PollRate time.Duration
 }
 
 type usecase struct {
+	config Config
 	repo   OrderRepository
 	broker MessageBroker
+	tx     TxManager
 }
 
-func NewUsecase(repo OrderRepository, broker MessageBroker) *usecase {
+func NewUsecase(repo OrderRepository, broker MessageBroker, config Config) *usecase {
 	return &usecase{
+		config: config,
 		repo:   repo,
 		broker: broker,
 	}
@@ -62,9 +69,11 @@ func (uc *usecase) CreateOrder(ctx context.Context, userID int, amount float64) 
 		Amount: amount,
 		Status: "created",
 	}
-
-	// tx.Begin()
-	// defer tx.rollback
+	err := uc.tx.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer uc.tx.Rollback()
 
 	if err := uc.repo.CreateOrder(ctx, order); err != nil {
 		return fmt.Errorf("failed to create order: %v", err)
@@ -80,22 +89,24 @@ func (uc *usecase) CreateOrder(ctx context.Context, userID int, amount float64) 
 		return fmt.Errorf("failed to create event in outbox table: %v", err)
 	}
 
-	// tx.commit
+	err = uc.tx.Commit(ctx)
+
+	if err != nil {
+		return fmt.Errorf("failed to commit transaction: %v", err)
+	}
 
 	return nil
 }
 
-// При использовании функций ниже в качестве методов структуры более высокого уровня (store) брокер и дб не передаются в качестве аргументов
-
 // функция переодически запускающая опрос outbox на наличие non-published ивентов; Запускается в отдельной горутине
-func RunOutboxPoller(ctx context.Context, broker MessageBroker, repo OrderRepository) error {
-	ticker := time.NewTicker(1 * time.Second)
+func (uc *usecase) RunOutboxPoller(ctx context.Context) error {
+	ticker := time.NewTicker(uc.config.PollRate)
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
-			if err := broker.PollOutbox(ctx, broker, repo); err != nil {
+			if err := uc.pollOutbox(ctx); err != nil {
 				return err
 			}
 		}
@@ -104,17 +115,17 @@ func RunOutboxPoller(ctx context.Context, broker MessageBroker, repo OrderReposi
 }
 
 // функция собирает non-published ивенты, отправляет в брокер, меняет статус на published
-func PollOutbox(ctx context.Context, broker MessageBroker, repo OrderRepository) error {
-	events, err := repo.GetUnpublishedEvents(ctx)
+func (uc *usecase) pollOutbox(ctx context.Context) error {
+	events, err := uc.repo.GetUnpublishedEvents(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get unpublished events: %w", err)
 	}
 
 	for _, event := range events {
-		if err := broker.PublishOrderCreated(ctx, &event); err != nil {
+		if err := uc.broker.PublishOrderCreated(ctx, &event); err != nil {
 			return fmt.Errorf("failed to publish event: %v", err)
 		}
-		if err := repo.SetEventAsPublished(ctx, &event); err != nil {
+		if err := uc.repo.SetEventAsPublished(ctx, &event); err != nil {
 			return fmt.Errorf("failed to update event status: %v", err)
 		}
 	}
