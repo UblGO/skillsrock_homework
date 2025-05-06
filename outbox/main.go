@@ -60,10 +60,10 @@ type usecase struct {
 	tx     TxManager
 }
 
-func NewUsecase(repo *OrderRepository, broker MessageBroker, config Config) *usecase {
+func NewUsecase(repo OrderRepository, broker MessageBroker, config Config) *usecase {
 	return &usecase{
 		config: config,
-		repo:   *repo,
+		repo:   repo,
 		broker: broker,
 	}
 }
@@ -106,44 +106,22 @@ func (uc *usecase) CreateOrder(ctx context.Context, userID int, amount float64) 
 	return nil
 }
 
-func (uc *usecase) RunOutboxProcessor(ctx context.Context) error {
-	pollErrChan := make(chan error)
-	cleanupErrChan := make(chan error)
-
-	go func() {
-		defer close(pollErrChan)
-		if err := uc.runOutboxPoller(ctx); err != nil {
-			pollErrChan <- err
-		}
-	}()
-
-	go func() {
-		defer close(cleanupErrChan)
-		if err := uc.runOutdatedEventsCleanup(ctx); err != nil {
-			cleanupErrChan <- err
-		}
-	}()
-	select {
-	case <-ctx.Done():
-		return nil
-	case err := <-pollErrChan:
-		uc.log.Error(err.Error())
-	case err := <-cleanupErrChan:
-		uc.log.Error(err.Error())
-	}
-	return nil
+func (uc *usecase) RunOutboxProcessor(ctx context.Context) {
+	go uc.runOutboxPoller(ctx)
+	go uc.runOutdatedEventsCleanup(ctx)
 }
 
 // функция вызывающая pollOutbox раз в PollRate
-func (uc *usecase) runOutboxPoller(ctx context.Context) error {
+func (uc *usecase) runOutboxPoller(ctx context.Context) {
 	pollTicker := time.NewTicker(uc.config.PollRate)
+	defer pollTicker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
-			return nil
+			return
 		case <-pollTicker.C:
 			if err := uc.pollOutbox(ctx); err != nil {
-				return fmt.Errorf("failed to poll outbox: %w", err)
+				uc.log.Error(err.Error())
 			}
 		}
 	}
@@ -178,15 +156,16 @@ func (uc *usecase) pollOutbox(ctx context.Context) error {
 }
 
 // функция вызывающая cleanupOutdatedEvents раз в CleanupInterval
-func (uc *usecase) runOutdatedEventsCleanup(ctx context.Context) error {
+func (uc *usecase) runOutdatedEventsCleanup(ctx context.Context) {
 	cleanUpTicker := time.NewTicker(uc.config.CleanupInterval)
+	defer cleanUpTicker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
-			return nil
+			return
 		case <-cleanUpTicker.C:
 			if err := uc.cleanupOutdatedEvents(ctx); err != nil {
-				return err
+				uc.log.Error(err.Error())
 			}
 		}
 	}
